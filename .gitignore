@@ -1,0 +1,7 @@
+.venv
+__pycache__
+.env
+*.md
+!readme.md
+*.pdf
+app.log
