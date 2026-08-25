@@ -1,27 +1,20 @@
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, Field, HttpUrl
 
 
 class SearchRequest(BaseModel):
-    query:str
-    region:str
+    query: str = Field(min_length=2, max_length=200)
+    region: str = Field(min_length=2, max_length=50)
+
 
 class ProductResult(BaseModel):
-    product_name:str
-    price: float
-    currency: Optional[str]
-    availability: Optional[str]
-    source: Optional[str] = None
-    source_url:str
-    relevance_score:float
+    product_name: str
+    price: float = Field(ge=0)
+    currency: str | None
+    availability: str | None
+    source: str | None = None
+    source_url: HttpUrl
+    relevance_score: float = Field(ge=0, le=1)
 
-class SearchResult(BaseModel):
-    title:str
-    link:str
-    source:str
-    price: Optional[str] = None
-    extracted_price: Optional[float] = None
-    serpapi_immersive_product_api: Optional[str] = None
 
 class SearchResponse(BaseModel):
-    results: List[ProductResult]
+    results: list[ProductResult]

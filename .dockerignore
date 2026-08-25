@@ -1,7 +1,12 @@
+.git
+.github
+.pytest_cache
+.ruff_cache
 .venv
 __pycache__
-results
-*.pyc
-*.pyo
-*.pyd
+tests
+.coverage
 .env
+*.py[cod]
+*.log
+.dockerignore

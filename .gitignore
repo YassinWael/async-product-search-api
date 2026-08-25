@@ -1,7 +1,9 @@
-.venv
-__pycache__
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
 .env
-*.md
-!readme.md
-*.pdf
-app.log
+*.py[cod]
+*.log
+htmlcov/
+.coverage

@@ -1,11 +1,20 @@
 import asyncio
+import ipaddress
 import logging
 import os
 import re
-import sys
+import socket
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import (
+    parse_qsl,
+    unquote,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlsplit,
+    urlunsplit,
+)
 
 import aiohttp
 import uvicorn
@@ -13,26 +22,45 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from google import genai
 from pydantic import BaseModel
 
 from models import ProductResult, SearchRequest, SearchResponse
 
 load_dotenv()
 
-SERP_API_KEY = os.getenv("serp_api_key")
-GENAI_API_KEY = os.getenv("genai_api_key")
+SERP_API_KEY = os.getenv("SERP_API_KEY") or os.getenv("serp_api_key")
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("genai_api_key")
 SERPAPI_URL = "https://serpapi.com/search.json"
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 CACHE_TTL_SECONDS = 300
+MAX_CACHE_ENTRIES = 256
+MAX_HTTP_ATTEMPTS = 3
+MAX_HTTP_REDIRECTS = 3
+MAX_CONCURRENT_SEARCHES = 4
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+CURRENCY_CODES = "SAR|AED|USD|EGP|GBP|EUR|CAD|INR|QAR|KWD|BHD|OMR|JOD"
+
+
+class UnsafeUrlError(ValueError):
+    pass
+
+
+class RetryableHttpStatusError(Exception):
+    pass
+
+
+FETCH_ERRORS = (
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    RetryableHttpStatusError,
+    UnsafeUrlError,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("app.log"),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -59,6 +87,7 @@ REGION_CONFIG = {
 
 SUPPORTED_SHOPPING_GLS = {"ae", "ca", "de", "fr", "gb", "in", "sa", "us"}
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_session
@@ -68,9 +97,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Product Search API", lifespan=lifespan)
-gemini_client = genai.Client(api_key=GENAI_API_KEY) if GENAI_API_KEY else None
+gemini_client = None
 http_session: aiohttp.ClientSession | None = None
 http_cache = {}
+search_slots = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
 
 
 class GeminiProductExtraction(BaseModel):
@@ -82,6 +112,18 @@ class GeminiProductExtraction(BaseModel):
 
 class GeminiPageExtraction(BaseModel):
     products: list[GeminiProductExtraction]
+
+
+def get_gemini_client():
+    """Create the optional Gemini client only when extraction needs it."""
+    global gemini_client
+    if not GENAI_API_KEY:
+        return None
+    if gemini_client is None:
+        from google import genai
+
+        gemini_client = genai.Client(api_key=GENAI_API_KEY)
+    return gemini_client
 
 
 def make_cache_key(prefix, url, params=None):
@@ -110,54 +152,180 @@ def get_cached_value(key):
 
 
 def set_cached_value(key, value, ttl=CACHE_TTL_SECONDS):
+    if len(http_cache) >= MAX_CACHE_ENTRIES and key not in http_cache:
+        http_cache.pop(next(iter(http_cache)))
     http_cache[key] = (time.time() + ttl, value)
 
 
-async def fetch_text(url, *, params=None, timeout=20, headers=None):
-    cache_key = make_cache_key("text", url, params)
+def split_url_params(url):
+    """Return a URL without its query string plus the parsed query parameters."""
+    parts = urlsplit(url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    return clean_url, params
+
+
+def safe_log_url(url):
+    """Hide key-like query values before a URL reaches logs."""
+    parts = urlsplit(url)
+    query = [
+        (key, "***" if "key" in key.lower() or "token" in key.lower() else value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
+async def resolve_host_addresses(hostname, port):
+    records = await asyncio.to_thread(
+        socket.getaddrinfo,
+        hostname,
+        port,
+        type=socket.SOCK_STREAM,
+    )
+    return {record[4][0].split("%", 1)[0] for record in records}
+
+
+async def ensure_public_http_url(url):
+    """Reject non-HTTP and private-network destinations before fetching them."""
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise UnsafeUrlError("Only absolute HTTP(S) URLs are allowed")
+    if parts.username or parts.password:
+        raise UnsafeUrlError("URLs containing credentials are not allowed")
+
+    hostname = parts.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise UnsafeUrlError("Local destinations are not allowed")
+
+    try:
+        addresses = {str(ipaddress.ip_address(hostname))}
+    except ValueError:
+        try:
+            addresses = await resolve_host_addresses(
+                hostname,
+                parts.port or (443 if parts.scheme == "https" else 80),
+            )
+        except OSError as error:
+            raise UnsafeUrlError("URL hostname could not be resolved") from error
+
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise UnsafeUrlError("Private or non-routable destinations are not allowed")
+
+
+async def request_value(url, *, params, timeout, headers, as_json):
+    current_url = url
+    current_params = params
+
+    for redirect_count in range(MAX_HTTP_REDIRECTS + 1):
+        await ensure_public_http_url(current_url)
+        async with http_session.get(
+            current_url,
+            params=current_params,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=False,
+        ) as response:
+            if response.status in REDIRECT_STATUS_CODES:
+                if redirect_count == MAX_HTTP_REDIRECTS:
+                    raise UnsafeUrlError("Too many redirects")
+                location = response.headers.get("Location")
+                if not location:
+                    raise UnsafeUrlError("Redirect response has no destination")
+                await response.read()
+                current_url = urljoin(str(response.url), location)
+                current_params = None
+                continue
+
+            if response.status in RETRYABLE_STATUS_CODES:
+                await response.read()
+                raise RetryableHttpStatusError(f"Temporary HTTP status {response.status}")
+
+            response.raise_for_status()
+            if as_json:
+                return await response.json(content_type=None)
+            return await response.text()
+
+    raise UnsafeUrlError("Too many redirects")
+
+
+async def _fetch(url, *, params=None, timeout=20, headers=None, as_json=False):
+    if http_session is None:
+        raise RuntimeError("HTTP session has not been initialized")
+
+    kind = "json" if as_json else "text"
+    cache_key = make_cache_key(kind, url, params)
     cached = get_cached_value(cache_key)
     if cached is not None:
-        logger.info("cache hit text %s", url)
+        logger.info("cache hit %s %s", kind, safe_log_url(url))
         return cached
 
-    logger.info("fetch text %s", url)
-    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    logger.info("fetch %s %s", kind, safe_log_url(url))
     request_headers = headers or {"User-Agent": "Mozilla/5.0"}
-    async with http_session.get(url, params=params, headers=request_headers, timeout=client_timeout) as response:
-        response.raise_for_status()
-        text = await response.text()
-    set_cached_value(cache_key, text)
-    return text
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+
+    for attempt in range(MAX_HTTP_ATTEMPTS):
+        try:
+            value = await request_value(
+                url,
+                params=params,
+                headers=request_headers,
+                timeout=client_timeout,
+                as_json=as_json,
+            )
+            set_cached_value(cache_key, value)
+            return value
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError, RetryableHttpStatusError):
+            if attempt + 1 >= MAX_HTTP_ATTEMPTS:
+                raise
+            await asyncio.sleep(2**attempt)
+
+    raise RuntimeError("HTTP request exhausted all retry attempts")
+
+
+async def fetch_text(url, *, params=None, timeout=20, headers=None):
+    return await _fetch(url, params=params, timeout=timeout, headers=headers)
 
 
 async def fetch_json(url, *, params=None, timeout=30, headers=None):
-    cache_key = make_cache_key("json", url, params)
-    cached = get_cached_value(cache_key)
-    if cached is not None:
-        logger.info("cache hit json %s", url)
-        return cached
-
-    logger.info("fetch json %s", url)
-    client_timeout = aiohttp.ClientTimeout(total=timeout)
-    request_headers = headers or {"User-Agent": "Mozilla/5.0"}
-    async with http_session.get(url, params=params, headers=request_headers, timeout=client_timeout) as response:
-        response.raise_for_status()
-        data = await response.json(content_type=None)
-    set_cached_value(cache_key, data)
-    return data
+    return await _fetch(
+        url,
+        params=params,
+        timeout=timeout,
+        headers=headers,
+        as_json=True,
+    )
 
 
 def get_currency(price_text):
     if not price_text:
         return None
-    if "SAR" in price_text:
+    text = price_text.upper()
+    if "SAR" in text:
         return "SAR"
-    if "USD" in price_text or "$" in price_text:
-        return "USD"
-    if "AED" in price_text:
+    if "AED" in text:
         return "AED"
-    if "EGP" in price_text:
+    if "EGP" in text or "ج" in text or "E£" in text or text == "LE":
         return "EGP"
+    if "CAD" in text or "C$" in text:
+        return "CAD"
+    if "USD" in text or "US$" in text or "$" in text:
+        return "USD"
+    if "GBP" in text or "£" in text:
+        return "GBP"
+    if "EUR" in text or "€" in text:
+        return "EUR"
+    if "INR" in text or "₹" in text:
+        return "INR"
+    if "QAR" in text:
+        return "QAR"
+    if "KWD" in text:
+        return "KWD"
+    if "BHD" in text:
+        return "BHD"
+    if "OMR" in text:
+        return "OMR"
+    if "JOD" in text:
+        return "JOD"
     return None
 
 
@@ -165,7 +333,8 @@ def get_availability(details):
     if not details:
         return None
 
-    text = " ".join(details).lower()
+    text = details if isinstance(details, str) else " ".join(details)
+    text = text.lower()
     if "out of stock" in text or "not available" in text:
         return "out_of_stock"
     if "in stock" in text:
@@ -188,10 +357,10 @@ def extract_price_and_currency(text):
         return None, None
 
     patterns = [
-        (r"(SAR|AED|USD|EGP)\s*([0-9][0-9,\.]*)", False),
-        (r"([0-9][0-9,\.]*)\s*(SAR|AED|USD|EGP)", True),
-        (r"(ج\.?م|E£|LE)\s*([0-9][0-9,\.]*)", False),
-        (r"([0-9][0-9,\.]*)\s*(ج\.?م|E£|LE)", True),
+        (rf"({CURRENCY_CODES})\s*([0-9][0-9,\.]*)", False),
+        (rf"([0-9][0-9,\.]*)\s*({CURRENCY_CODES})", True),
+        (r"(ج\.?م|E£|LE|C\$|US\$|\$|£|€|₹)\s*([0-9][0-9,\.]*)", False),
+        (r"([0-9][0-9,\.]*)\s*(ج\.?م|E£|LE|C\$|US\$|\$|£|€|₹)", True),
     ]
 
     for pattern, reversed_match in patterns:
@@ -210,10 +379,7 @@ def extract_price_and_currency(text):
         except ValueError:
             continue
 
-        currency = get_currency(currency_text.upper())
-        if currency_text in {"ج.م", "E£", "LE"}:
-            currency = "EGP"
-        return amount, currency
+        return amount, get_currency(currency_text)
 
     return None, None
 
@@ -246,11 +412,13 @@ def is_listing_like_page(link, title):
 async def scrape_page(link, fallback_title):
     try:
         html = await fetch_text(link, timeout=20)
-    except aiohttp.ClientError:
+    except FETCH_ERRORS:
         logger.warning("scrape failed %s", link)
         return None
 
-    title_match = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html, re.IGNORECASE)
+    title_match = re.search(
+        r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html, re.IGNORECASE
+    )
     if title_match:
         title = title_match.group(1)
     else:
@@ -274,12 +442,13 @@ async def scrape_page(link, fallback_title):
 
 
 async def extract_with_gemini(link, fallback_title, max_products):
-    if not gemini_client:
+    client = get_gemini_client()
+    if not client:
         return []
 
     try:
         html = await fetch_text(link, timeout=20)
-    except aiohttp.ClientError:
+    except FETCH_ERRORS:
         logger.warning("gemini fetch failed %s", link)
         return []
 
@@ -299,7 +468,8 @@ Rules:
 - If it is a category/listing page, return up to {max_products} concrete products that clearly match the query.
 - If the page is a blog/news/help/about page, return an empty products list.
 - Ignore fake prices like product counts, installment months, ratings, storage sizes, discount percentages, or filter values.
-- Currency must be one of: EGP, SAR, AED, USD.
+- Currency must be one of: EGP, SAR, AED, USD, GBP, EUR, CAD, INR, QAR, KWD,
+  BHD, OMR, JOD.
 - Availability should be one of: in_stock, out_of_stock, preorder, or null.
 
 URL: {link}
@@ -312,7 +482,7 @@ Page text:
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: gemini_client.models.generate_content(
+            lambda: client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config={
@@ -365,7 +535,7 @@ async def find_product_url(listing_url, product_title):
     """
     try:
         html = await fetch_text(listing_url, timeout=20)
-    except aiohttp.ClientError:
+    except FETCH_ERRORS:
         logger.warning("listing fetch failed %s", listing_url)
         return None
 
@@ -412,12 +582,16 @@ async def process_shopping_item(item, query, max_stores):
     if not immersive_url:
         return []
 
-    if "api_key=" not in immersive_url:
-        immersive_url = f"{immersive_url}&api_key={SERP_API_KEY}"
+    immersive_url, immersive_params = split_url_params(immersive_url)
+    immersive_params["api_key"] = SERP_API_KEY
 
     try:
-        immersive_response = await fetch_json(immersive_url, timeout=30)
-    except aiohttp.ClientError:
+        immersive_response = await fetch_json(
+            immersive_url,
+            params=immersive_params,
+            timeout=30,
+        )
+    except FETCH_ERRORS:
         logger.warning("shopping item failed %s", immersive_url)
         return []
 
@@ -428,6 +602,11 @@ async def process_shopping_item(item, query, max_stores):
         price = store.get("extracted_price")
         title = store.get("title") or item.get("title")
         if not source_url or price is None or not title:
+            continue
+
+        try:
+            await ensure_public_http_url(source_url)
+        except UnsafeUrlError:
             continue
 
         price_text = store.get("price") or item.get("price")
@@ -494,13 +673,17 @@ def dedupe_results(results):
 
 async def search_products(query, region, max_products=5, max_stores=3):
     if not SERP_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing serp_api_key in environment")
+        raise HTTPException(status_code=500, detail="Missing SERP_API_KEY in environment")
+
+    query = query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     region_data = REGION_CONFIG.get(region)
     if not region_data:
         raise HTTPException(status_code=400, detail=f"Unsupported region: {region}")
 
-    logger.info("search started query=%s region=%s", query, region)
+    logger.info("search started region=%s", region)
 
     use_shopping = region_data["gl"] in SUPPORTED_SHOPPING_GLS
     grouped_results = []
@@ -524,8 +707,12 @@ async def search_products(query, region, max_products=5, max_stores=3):
             grouped_results = await asyncio.gather(
                 *(process_shopping_item(item, query, max_stores) for item in items)
             )
-        except aiohttp.ClientError as e:
-            logger.warning("shopping search failed (%s), falling back to organic for %s", e, region)
+        except FETCH_ERRORS:
+            logger.warning("shopping search failed; falling back to organic for %s", region)
+            use_shopping = False
+
+        if use_shopping and not any(grouped_results):
+            logger.info("shopping returned no usable products; trying organic search")
             use_shopping = False
 
     if not use_shopping:
@@ -543,8 +730,8 @@ async def search_products(query, region, max_products=5, max_stores=3):
                 },
                 timeout=30,
             )
-        except aiohttp.ClientError as e:
-            logger.error("organic search also failed: %s", e)
+        except FETCH_ERRORS:
+            logger.error("organic search also failed")
             raise HTTPException(status_code=502, detail="Search provider returned an error")
         items = google_response.get("organic_results", [])[:max_products]
         grouped_results = await asyncio.gather(
@@ -555,15 +742,14 @@ async def search_products(query, region, max_products=5, max_stores=3):
     flat_results = dedupe_results(flat_results)
     flat_results.sort(key=lambda item: (-item.relevance_score, item.price))
 
-    logger.info("search finished query=%s region=%s results=%s", query, region, len(flat_results))
+    logger.info("search finished region=%s results=%s", region, len(flat_results))
     return flat_results
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
     options = "\n".join(
-        f'<option value="{region}">{region}</option>'
-        for region in REGION_CONFIG.keys()
+        f'<option value="{region}">{region}</option>' for region in REGION_CONFIG.keys()
     )
     return f"""
 <!doctype html>
@@ -639,7 +825,7 @@ async def home():
 
     form.addEventListener("submit", async (event) => {{
       event.preventDefault();
-      results.innerHTML = "";
+      results.replaceChildren();
       status.textContent = "Loading...";
 
       const payload = {{
@@ -661,16 +847,30 @@ async def home():
         }}
 
         status.textContent = `Found ${{data.results.length}} results`;
-        results.innerHTML = data.results.map(item => `
-          <div class="card">
-            <strong>${{item.product_name}}</strong><br>
-            <span class="muted">${{item.source || "Unknown source"}}</span><br>
-            Price: ${{item.price}} ${{item.currency || ""}}<br>
-            Availability: ${{item.availability || "unknown"}}<br>
-            Relevance: ${{item.relevance_score}}<br>
-            <a href="${{item.source_url}}" target="_blank">Open product</a>
-          </div>
-        `).join("");
+        for (const item of data.results) {{
+          const card = document.createElement("div");
+          card.className = "card";
+
+          const title = document.createElement("strong");
+          title.textContent = item.product_name;
+          card.append(title, document.createElement("br"));
+
+          const source = document.createElement("span");
+          source.className = "muted";
+          source.textContent = item.source || "Unknown source";
+          card.append(source, document.createElement("br"));
+          card.append(`Price: ${{item.price}} ${{item.currency || ""}}`, document.createElement("br"));
+          card.append(`Availability: ${{item.availability || "unknown"}}`, document.createElement("br"));
+          card.append(`Relevance: ${{item.relevance_score}}`, document.createElement("br"));
+
+          const link = document.createElement("a");
+          link.href = item.source_url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = "Open product";
+          card.append(link);
+          results.append(card);
+        }}
       }} catch (error) {{
         status.textContent = "Something went wrong";
       }}
@@ -683,20 +883,10 @@ async def home():
 
 @app.post("/search", response_model=SearchResponse)
 async def search_endpoint(payload: SearchRequest):
-    logger.info("request received query=%s region=%s", payload.query, payload.region)
-    return SearchResponse(results=await search_products(payload.query, payload.region))
-
-
-async def main():
-    results = await search_products("dell laptop", "Saudi", max_products=5, max_stores=3)
-    for result in results[:5]:
-        print("=" * 20)
-        print(result.model_dump())
-        print("=" * 20)
+    async with search_slots:
+        results = await search_products(payload.query, payload.region)
+    return SearchResponse(results=results)
 
 
 if __name__ == "__main__":
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
